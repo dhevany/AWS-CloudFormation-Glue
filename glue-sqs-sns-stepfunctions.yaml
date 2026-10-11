@@ -1,0 +1,146 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Glue job orchestrated by Step Functions, followed by SQS and SNS.
+
+Parameters:
+  GlueScriptBucket:
+    Type: String
+    Description: Existing S3 bucket containing the Glue script
+  GlueScriptKey:
+    Type: String
+    Default: scripts/glue_job.py
+    Description: Object key for the Glue Python script
+
+Resources:
+  GlueExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: glue.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole
+      Policies:
+        - PolicyName: ReadGlueScript
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub arn:${AWS::Partition}:s3:::${GlueScriptBucket}/${GlueScriptKey}
+
+  DataProcessingJob:
+    Type: AWS::Glue::Job
+    Properties:
+      Name: !Sub '${AWS::StackName}-data-processing'
+      Role: !GetAtt GlueExecutionRole.Arn
+      GlueVersion: '4.0'
+      Command:
+        Name: glueetl
+        PythonVersion: '3'
+        ScriptLocation: !Sub 's3://${GlueScriptBucket}/${GlueScriptKey}'
+      WorkerType: G.1X
+      NumberOfWorkers: 2
+      Timeout: 10
+      MaxRetries: 0
+
+  ProcessingQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      VisibilityTimeout: 60
+
+  NotificationTopic:
+    Type: AWS::SNS::Topic
+
+  StepFunctionsExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: OrchestrateGlueSqsSns
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - glue:StartJobRun
+                  - glue:GetJobRun
+                  - glue:GetJobRuns
+                  - glue:BatchStopJobRun
+                Resource: !Sub 'arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:job/${DataProcessingJob}'
+              - Effect: Allow
+                Action: sqs:SendMessage
+                Resource: !GetAtt ProcessingQueue.Arn
+              - Effect: Allow
+                Action: sns:Publish
+                Resource: !Ref NotificationTopic
+              - Effect: Allow
+                Action:
+                  - events:PutRule
+                  - events:PutTargets
+                  - events:DescribeRule
+                Resource: !Sub 'arn:${AWS::Partition}:events:${AWS::Region}:${AWS::AccountId}:rule/StepFunctionsGetEventsForGlueJobRule'
+
+  ProcessingStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineType: STANDARD
+      RoleArn: !GetAtt StepFunctionsExecutionRole.Arn
+      DefinitionString: !Sub |
+        {
+          "StartAt": "RunGlueJob",
+          "States": {
+            "RunGlueJob": {
+              "Type": "Task",
+              "Resource": "arn:${AWS::Partition}:states:::glue:startJobRun.sync",
+              "Parameters": {
+                "JobName": "${DataProcessingJob}"
+              },
+              "ResultPath": "$.glueResult",
+              "Next": "SendSQSMessage"
+            },
+            "SendSQSMessage": {
+              "Type": "Task",
+              "Resource": "arn:${AWS::Partition}:states:::sqs:sendMessage",
+              "Parameters": {
+                "QueueUrl": "${ProcessingQueue}",
+                "MessageBody": "Glue processing completed successfully"
+              },
+              "ResultPath": "$.sqsResult",
+              "Next": "PublishSNSNotification"
+            },
+            "PublishSNSNotification": {
+              "Type": "Task",
+              "Resource": "arn:${AWS::Partition}:states:::sns:publish",
+              "Parameters": {
+                "TopicArn": "${NotificationTopic}",
+                "Subject": "AWS Workflow Completed",
+                "Message": "Glue processing completed and an SQS message was sent."
+              },
+              "ResultPath": "$.snsResult",
+              "Next": "Stop"
+            },
+            "Stop": {
+              "Type": "Succeed"
+            }
+          }
+        }
+
+Outputs:
+  GlueJobName:
+    Value: !Ref DataProcessingJob
+  QueueUrl:
+    Value: !Ref ProcessingQueue
+  TopicArn:
+    Value: !Ref NotificationTopic
+  StateMachineArn:
+    Value: !Ref ProcessingStateMachine
